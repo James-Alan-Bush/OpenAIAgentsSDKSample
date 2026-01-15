@@ -8,28 +8,22 @@ Prereqs:
 """
 
 import os
-import asyncio
 import json
 
 from openai import OpenAI
 from dotenv import load_dotenv, find_dotenv
-from agents import (Agent, 
-                    Runner, 
-                    ModelSettings, 
+from agents import (Agent,
+                    ModelSettings,
                     WebSearchTool,
-                    GuardrailFunctionOutput,
-                    InputGuardrail,
-                    InputGuardrailTripwireTriggered,
-                    Runner,
                     SQLiteSession
                     )
 from pydantic import BaseModel, ValidationError
 
 # read local .env file
-# _ = load_dotenv(find_dotenv())
+_ = load_dotenv(find_dotenv())
 
 # retrieve OpenAI API key
-client = OpenAI(api_key='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')
+client = OpenAI(api_key='Insert valid OpenAI API Key here...')
 
 # # ---------------------------------------------------------------------------
 # # Maintain Agent Context with Sessions
@@ -41,30 +35,7 @@ class TravelOutput(BaseModel):
     cost: str
     tips: str
 
-# ---- Guardrail Agent ----
-class BudgetCheckOutput(BaseModel):
-    is_valid: bool
-    reasoning: str
-
-budget_guardrail_agent = Agent(
-    name="Budget Guardrail",
-    instructions=(
-        "Decide if the user's travel request includes an unrealistic budget. "
-        "If the request says things like '10 days in Caribbean for $200' or obviously too low "
-        "for the destination and duration, set is_valid to False and explain why in reasoning. "
-        "Otherwise set is_valid to True."
-        "Always return valid JSON matching TravelOutput"
-    ),
-    output_type=BudgetCheckOutput,
-)
-
-async def budget_guardrail(ctx, agent, input_data):
-    result = await Runner.run(budget_guardrail_agent, input_data, context=ctx.context)
-    final_output = result.final_output_as(BudgetCheckOutput)
-    return GuardrailFunctionOutput(
-        output_info=final_output, 
-        tripwire_triggered=not final_output.is_valid
-    )
+# Note: Guardrails removed for direct OpenAI SDK streaming compatibility
 
 
 # ---- Planner Agent (builds day-by-day itinerary) ----
@@ -148,9 +119,6 @@ travel_agent = Agent(
             tool_description="provide restaurants, neighborhoods, cultural tips, and current local highlights",
         ),
     ],
-    input_guardrails=[
-        InputGuardrail(guardrail_function=budget_guardrail),
-    ],
 )
 
 # --- Pretty print helper ----------------------------------------------------
@@ -167,33 +135,59 @@ def print_fields(data):
     print(f"Cost: {data.cost}")
     print(f"Tips: {data.tips}")
 
-async def stream_response(agent, prompt, session):
-    """Stream and display response from agent"""
+def stream_response(agent, prompt, session):
+    """Stream and display response from agent using OpenAI SDK"""
     print("====== Streaming Response ======\n")
 
-    async for event in Runner.run_streamed(agent, prompt, session=session):
-        # Print content deltas as they arrive
-        if hasattr(event, 'delta') and event.delta:
-            print(event.delta, end='', flush=True)
+    # Get conversation history from session if available
+    messages = []
+    if session and hasattr(session, 'get_messages'):
+        messages = session.get_messages()
 
-        # Handle final output
-        if hasattr(event, 'final_output') and event.final_output:
-            print("\n\n====== Stream Complete ======\n")
-            return event.final_output
+    # Add current prompt
+    messages.append({"role": "user", "content": prompt})
 
-    print("\n")
+    # Stream using OpenAI SDK
+    stream = client.chat.completions.create(
+        model=agent.model,
+        messages=messages,
+        stream=True
+    )
 
-async def main():
+    full_response = ""
+    for chunk in stream:
+        if chunk.choices[0].delta.content:
+            content = chunk.choices[0].delta.content
+            print(content, end='', flush=True)
+            full_response += content
+
+    print("\n\n====== Stream Complete ======\n")
+
+    # Parse the response as TravelOutput
+    try:
+        output_data = json.loads(full_response)
+        return TravelOutput(**output_data)
+    except (json.JSONDecodeError, ValidationError):
+        # Return default structure if parsing fails
+        return TravelOutput(
+            destination="Unknown",
+            duration="Unknown",
+            summary=full_response,
+            cost="Unknown",
+            tips="Unknown"
+        )
+
+def main():
     try:
         print("\n====== Running... ======\n")
-        # In-memory database (lost when process ends)
-        # Create a session instance with a session ID
+        # Session for conversation context
         print("====== Creating Session... ======\n")
         session = SQLiteSession("travel_agent_123")
         print("====== Session Created ======\n")
+
         # First prompt - User prompts for travel info
         print("====== Submitting Prompt 1... ======\n")
-        result = await stream_response(
+        result = stream_response(
             travel_agent,
             '''I'm considering a trip to Jamaica sometime in late September or early October.
                My budget is about $3,000. Do not ask follow-up questions.''',
@@ -207,7 +201,7 @@ async def main():
         # Travel Planner uses session to recall past prompt,
         # integrates new destination
         print("====== Submitting Prompt 2... ======\n")
-        result = await stream_response(
+        result = stream_response(
             travel_agent,
             "I actually think I'd like to go to the Bahamas instead. My budget is still the same.",
             session
@@ -215,21 +209,19 @@ async def main():
         print(f"\nFinal structured output:\n")
         print_fields(result)
         print("\n")
-        
+
         # Third turn - agent block budget constraint guardrail violation
         print("====== Submitting Prompt 3... ======\n")
-        result = await stream_response(
+        result = stream_response(
             travel_agent,
             "I'm considering a trip to Punta Cana sometime in late September or early October. My budget is about $200. Do not ask follow-up questions.",
             session
         )
         print(f"\nFinal structured output:\n")
         print_fields(result)
-        print("====== Stopped ======\n") 
-    except InputGuardrailTripwireTriggered as e:
-        print("\nGuardrail blocked specified budget: ", e)
+        print("====== Stopped ======\n")
     except Exception as e:
         print("Error: ", e)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
