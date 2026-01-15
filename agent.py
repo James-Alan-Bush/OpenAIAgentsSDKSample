@@ -26,7 +26,7 @@ from agents import (Agent,
 from pydantic import BaseModel, ValidationError
 
 # read local .env file
-# _ = load_dotenv(find_dotenv()) 
+# _ = load_dotenv(find_dotenv())
 
 # retrieve OpenAI API key
 client = OpenAI(api_key='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')
@@ -53,6 +53,7 @@ budget_guardrail_agent = Agent(
         "If the request says things like '10 days in Caribbean for $200' or obviously too low "
         "for the destination and duration, set is_valid to False and explain why in reasoning. "
         "Otherwise set is_valid to True."
+        "Always return valid JSON matching TravelOutput"
     ),
     output_type=BudgetCheckOutput,
 )
@@ -73,15 +74,12 @@ planner_agent = Agent(
     handoff_description="Use me when the user asks to plan or outline an itinerary, schedule, or daily plan.",
     instructions=(
         "You specialize in building day-by-day travel itineraries and sequencing activities. "
-        'Always return JSON with this structure: {"destination":"string","duration":"string","summary":"string"}.'
+        'Always return JSON with this structure: {"destination":"string","duration":"string","summary":"string"}. Always return valid JSON matching TravelOutput'
     ),
     model_settings=ModelSettings(
-        reasoning={"effort": "high"},
-        extra_body={"text": {"verbosity": "high"}}
+        reasoning={"effort": "high"}, extra_body={"text": {"verbosity": "high"}}
     ),
-    tools=[
-        WebSearchTool()
-    ]
+    tools=[WebSearchTool()],
 )
 
 # ---- Budget Agent (estimates costs under constraints) ----
@@ -91,12 +89,11 @@ budget_agent = Agent(
     handoff_description="Use me when the user mentions budget, price, cost, dollars, under $X, or asks 'how much'.",
     instructions=(
         "You estimate costs for lodging, food, transport, and activities at a high level; flag budget violations. "
-        'Always return JSON with this structure: {"cost":"string"}.'
+        'Always return JSON with this structure: {"cost":"string"}. Always return valid JSON matching TravelOutput'
     ),
     model_settings=ModelSettings(
-        reasoning={"effort": "low"},
-        extra_body={"text": {"verbosity": "low"}}
-    )
+        reasoning={"effort": "low"}, extra_body={"text": {"verbosity": "low"}}
+    ),
 )
 
 # ---- Local Guide Agent (adds local tips & dining) ----
@@ -106,15 +103,12 @@ local_guide_agent = Agent(
     handoff_description="Use me when the user asks for food, restaurants, neighborhoods, local tips, or 'what's good nearby'.",
     instructions=(
         "You provide restaurants, neighborhoods, cultural tips, and current local highlights. "
-        'Always return JSON with this structure: {"tips":"string"}.'
+        'Always return JSON with this structure: {"tips":"string"}. Always return valid JSON matching TravelOutput.'
     ),
     model_settings=ModelSettings(
-        reasoning={"effort": "low"},
-        extra_body={"text": {"verbosity": "low"}}
+        reasoning={"effort": "low"}, extra_body={"text": {"verbosity": "low"}}
     ),
-    tools=[
-        WebSearchTool()
-    ]
+    tools=[WebSearchTool()],
 )
 
 # ---- Core orchestrator: Travel Agent ----
@@ -133,28 +127,30 @@ travel_agent = Agent(
         "After receiving results from these agents, combine their outputs into a single structured summary.\n"
         "\n"
         "Return JSON output using this exact structure:\n"
-        "{\"destination\": \"string\", \"duration\": \"string\", \"summary\": \"string\", \"cost\": \"string\", \"tips\": \"string\"}.\n"
+        '{"destination": "string", "duration": "string", "summary": "string", "cost": "string", "tips": "string"}. Always return valid JSON matching TravelOutput.\n'
     ),
-    output_type=TravelOutput, 
+    output_type=TravelOutput,
     model_settings=ModelSettings(
-        reasoning={"effort": "low"},   # minimal | low | medium | high 
-        extra_body={"text":{"verbosity":"low"}}  # low | medium | high
+        reasoning={"effort": "low"},  # minimal | low | medium | high
+        extra_body={"text": {"verbosity": "low"}},  # low | medium | high
     ),
     tools=[
         WebSearchTool(),
         planner_agent.as_tool(
-            tool_name="planner_agent", 
-            tool_description="plan or outline an itinerary, schedule, or daily plan"),
+            tool_name="planner_agent",
+            tool_description="plan or outline an itinerary, schedule, or daily plan",
+        ),
         budget_agent.as_tool(
-            tool_name="budget_agent", 
-            tool_description="calculates the cost of a trip"),
+            tool_name="budget_agent", tool_description="calculates the cost of a trip"
+        ),
         local_guide_agent.as_tool(
-            tool_name="local_guide_agent", 
-            tool_description="provide restaurants, neighborhoods, cultural tips, and current local highlights")
+            tool_name="local_guide_agent",
+            tool_description="provide restaurants, neighborhoods, cultural tips, and current local highlights",
+        ),
     ],
     input_guardrails=[
         InputGuardrail(guardrail_function=budget_guardrail),
-    ]
+    ],
 )
 
 # --- Pretty print helper ----------------------------------------------------
@@ -171,6 +167,22 @@ def print_fields(data):
     print(f"Cost: {data.cost}")
     print(f"Tips: {data.tips}")
 
+async def stream_response(agent, prompt, session):
+    """Stream and display response from agent"""
+    print("====== Streaming Response ======\n")
+
+    async for event in Runner.run_streamed(agent, prompt, session=session):
+        # Print content deltas as they arrive
+        if hasattr(event, 'delta') and event.delta:
+            print(event.delta, end='', flush=True)
+
+        # Handle final output
+        if hasattr(event, 'final_output') and event.final_output:
+            print("\n\n====== Stream Complete ======\n")
+            return event.final_output
+
+    print("\n")
+
 async def main():
     try:
         print("\n====== Running... ======\n")
@@ -180,43 +192,39 @@ async def main():
         session = SQLiteSession("travel_agent_123")
         print("====== Session Created ======\n")
         # First prompt - User prompts for travel info
-        print("====== Submitting Prompt... ======\n")
-        result = await Runner.run(
+        print("====== Submitting Prompt 1... ======\n")
+        result = await stream_response(
             travel_agent,
-            '''I'm considering a trip to Jamaica sometime in late September or early October. 
+            '''I'm considering a trip to Jamaica sometime in late September or early October.
                My budget is about $3,000. Do not ask follow-up questions.''',
-            session=session
+            session
         )
-        print("====== Prompt Submitted ======\n")
-        print("====== Displaying Response ======\n")
-        print_fields(result.final_output)
-        print("====== Response Displayed ======\n")  
-        print("====== Submitting Prompt... ======\n")
+        print(f"\nFinal structured output:\n")
+        print_fields(result)
+        print("\n")
 
         # Second turn - user changes destination
-		# Travel Planner uses session to recall past prompt,
-		# integrates new destination
-        result = await Runner.run(
+        # Travel Planner uses session to recall past prompt,
+        # integrates new destination
+        print("====== Submitting Prompt 2... ======\n")
+        result = await stream_response(
             travel_agent,
             "I actually think I'd like to go to the Bahamas instead. My budget is still the same.",
-            session=session
+            session
         )
-        print("====== Prompt Submitted ======\n")
-        print("====== Displaying Response ======\n")
-        print_fields(result.final_output)
-        print("====== Response Displayed ======\n")
-        print("====== Submitting Prompt... ======\n")
+        print(f"\nFinal structured output:\n")
+        print_fields(result)
+        print("\n")
         
         # Third turn - agent block budget constraint guardrail violation
-        result = await Runner.run(
+        print("====== Submitting Prompt 3... ======\n")
+        result = await stream_response(
             travel_agent,
             "I'm considering a trip to Punta Cana sometime in late September or early October. My budget is about $200. Do not ask follow-up questions.",
-            session=session
+            session
         )
-        print("====== Prompt Submitted ======\n")
-        print("====== Displaying Response ======\n")
-        print_fields(result.final_output)
-        print("====== Response Displayed ======\n")
+        print(f"\nFinal structured output:\n")
+        print_fields(result)
         print("====== Stopped ======\n") 
     except InputGuardrailTripwireTriggered as e:
         print("\nGuardrail blocked specified budget: ", e)
